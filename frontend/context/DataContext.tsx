@@ -1,7 +1,8 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Lock, AlertTriangle, X } from 'lucide-react';
-import { Customer, Shipment, Payment, Expense, CompanySettings, DashboardStats } from '../types';
+import { Customer, Shipment, Payment, Expense, CompanySettings, DashboardStats, Notification, Toast } from '../types';
 import { encryptData, decryptData } from '../lib/crypto';
+
 
 interface DataContextType {
   customers: Customer[];
@@ -25,6 +26,11 @@ interface DataContextType {
   isAuthenticated: boolean;
   login: (username: string, password: string) => Promise<boolean>;
   logout: () => void;
+  notifications: Notification[];
+  markAllNotificationsAsRead: () => Promise<void>;
+  clearAllNotifications: () => Promise<void>;
+  toasts: Toast[];
+  removeToast: (id: string) => void;
 }
 
 const DataContext = createContext<DataContextType | undefined>(undefined);
@@ -362,6 +368,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [shipments, setShipments] = useState<Shipment[]>([]);
   const [payments, setPayments] = useState<Payment[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [toasts, setToasts] = useState<Toast[]>([]);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return localStorage.getItem('dllms_authenticated') === 'true';
   });
@@ -385,15 +393,55 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     totalOutstanding: 0,
   });
 
+  const removeToast = (id: string) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  };
+
+  const addToast = (message: string, type?: string) => {
+    const id = `TOAST-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    setToasts(prev => [...prev, { id, message, type }]);
+    setTimeout(() => {
+      removeToast(id);
+    }, 4000);
+  };
+
+  const refreshData = async () => {
+    try {
+      const [custRes, shpRes, payRes, expRes] = await Promise.all([
+        apiFetch('/api/customers'),
+        apiFetch('/api/shipments'),
+        apiFetch('/api/payments'),
+        apiFetch('/api/expenses')
+      ]);
+
+      if (custRes.ok && shpRes.ok && payRes.ok && expRes.ok) {
+        const [custs, shps, pays, exps] = await Promise.all([
+          custRes.json(),
+          shpRes.json(),
+          payRes.json(),
+          expRes.json()
+        ]);
+        setCustomers(custs);
+        setShipments(shps);
+        setPayments(pays);
+        setExpenses(exps);
+      }
+    } catch (err) {
+      console.warn('[DataContext] Failed to refresh data from API:', err);
+    }
+  };
+
+
   // Load initial data from database API with LocalStorage fallback
   useEffect(() => {
     async function loadData() {
       try {
-        const [custRes, shpRes, payRes, expRes] = await Promise.all([
+        const [custRes, shpRes, payRes, expRes, notifRes] = await Promise.all([
           apiFetch('/api/customers'),
           apiFetch('/api/shipments'),
           apiFetch('/api/payments'),
-          apiFetch('/api/expenses')
+          apiFetch('/api/expenses'),
+          apiFetch('/api/notifications')
         ]);
 
         if (custRes.ok && shpRes.ok && payRes.ok && expRes.ok) {
@@ -408,6 +456,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setPayments(pays);
           setExpenses(exps);
           console.log('[DataContext] Successfully connected and loaded data from database API.');
+
+          if (notifRes.ok) {
+            const notifs = await notifRes.json();
+            setNotifications(notifs);
+          }
           return;
         }
       } catch (err) {
@@ -427,6 +480,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
     loadData();
   }, []);
+
 
   // Persist and update calculated outstanding amounts and dashboard stats
   useEffect(() => {
@@ -777,6 +831,91 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.removeItem('dllms_authenticated');
   };
 
+  const markAllNotificationsAsRead = async () => {
+    try {
+      const res = await apiFetch('/api/notifications/read', {
+        method: 'POST'
+      });
+      if (res.ok) {
+        setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+      }
+    } catch (err) {
+      console.error('[DataContext] Failed to mark notifications as read:', err);
+      setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+    }
+  };
+
+  const clearAllNotifications = async () => {
+    try {
+      const res = await apiFetch('/api/notifications/clear', {
+        method: 'POST'
+      });
+      if (res.ok) {
+        setNotifications([]);
+      }
+    } catch (err) {
+      console.error('[DataContext] Failed to clear notifications:', err);
+      setNotifications([]);
+    }
+  };
+
+  // WebSocket Connection for Real-time Notifications & Sync
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: number;
+
+    function connectWS() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/ws-proxy`;
+      console.log(`[WS] Connecting to ${wsUrl}...`);
+      
+      ws = new WebSocket(wsUrl);
+
+      ws.onmessage = async (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.payload) {
+            const decrypted = await decryptData(data.payload);
+            const message = JSON.parse(decrypted);
+            console.log('[WS] Received message:', message);
+
+            if (message.type === 'INIT_NOTIFICATIONS') {
+              setNotifications(message.notifications);
+            } else if (message.type === 'NEW_NOTIFICATION') {
+              setNotifications(prev => [message.notification, ...prev]);
+              addToast(message.notification.message, message.notification.type);
+            } else if (message.type === 'DATA_CHANGE') {
+              refreshData();
+            }
+          }
+        } catch (err) {
+          console.error('[WS] Error processing message:', err);
+        }
+      };
+
+      ws.onclose = () => {
+        console.log('[WS] Connection closed. Attempting reconnect in 3s...');
+        reconnectTimeout = window.setTimeout(connectWS, 3000);
+      };
+
+      ws.onerror = (err) => {
+        console.error('[WS] Connection error:', err);
+        ws?.close();
+      };
+    }
+
+    connectWS();
+
+    return () => {
+      if (ws) {
+        ws.onclose = null; // Prevent reconnect loop
+        ws.close();
+      }
+      clearTimeout(reconnectTimeout);
+    };
+  }, []);
+
+
   return (
     <DataContext.Provider
       value={{
@@ -801,6 +940,11 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isAuthenticated,
         login,
         logout,
+        notifications,
+        markAllNotificationsAsRead,
+        clearAllNotifications,
+        toasts,
+        removeToast,
       }}
     >
       {children}

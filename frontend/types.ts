@@ -63,3 +63,18 @@ export interface CompanySettings {
   currency: string;
 }
 
+export interface Notification {
+  id: string;
+  type: string;
+  message: string;
+  timestamp: string;
+  read: boolean;
+}
+
+export interface Toast {
+  id: string;
+  message: string;
+  type?: string;
+}
+
+

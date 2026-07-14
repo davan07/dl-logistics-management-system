@@ -10,6 +10,8 @@ import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import path from 'path';
 import { encryptData, decryptData } from './crypto.js';
+import { WebSocketServer } from 'ws';
+
 
 const app = express();
 app.use(express.json({limit: process?.env?.API_PAYLOAD_MAX_SIZE || "7mb"}));
@@ -176,7 +178,51 @@ async function deleteTableData(tableName, id) {
 
 
 
+
+let notifications = [];
+const clients = new Set();
+
+function createAndBroadcastNotification(type, message) {
+  const notification = {
+    id: `NOTIF-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+    type,
+    message,
+    timestamp: new Date().toISOString(),
+    read: false
+  };
+
+  notifications.unshift(notification);
+  if (notifications.length > 50) {
+    notifications = notifications.slice(0, 50);
+  }
+
+  broadcast({
+    type: 'NEW_NOTIFICATION',
+    notification
+  });
+
+  broadcast({
+    type: 'DATA_CHANGE',
+    dataType: type
+  });
+}
+
+function broadcast(data) {
+  try {
+    const payload = encryptData(JSON.stringify(data));
+    const rawMessage = JSON.stringify({ payload });
+    for (const client of clients) {
+      if (client.readyState === 1) { // OPEN
+        client.send(rawMessage);
+      }
+    }
+  } catch (err) {
+    console.error('[WS] Broadcast failed:', err);
+  }
+}
+
 // --- Database REST API Routes ---
+
 
 // Customers Routes
 app.get('/api/customers', async (req, res) => {
@@ -192,6 +238,10 @@ app.get('/api/customers', async (req, res) => {
 app.post('/api/customers', async (req, res) => {
   try {
     const customer = await insertTableData('customers', req.body);
+    createAndBroadcastNotification(
+      'customer',
+      `New customer "${customer.companyName || customer.id}" added successfully.`
+    );
     res.status(201).json(customer);
   } catch (error) {
     console.error('[Node Proxy] Error POST /api/customers:', error);
@@ -202,6 +252,10 @@ app.post('/api/customers', async (req, res) => {
 app.put('/api/customers/:id', async (req, res) => {
   try {
     const customer = await updateTableData('customers', req.params.id, req.body);
+    createAndBroadcastNotification(
+      'customer',
+      `Customer "${customer.companyName || customer.id}" details updated.`
+    );
     res.json(customer);
   } catch (error) {
     console.error('[Node Proxy] Error PUT /api/customers:', error);
@@ -212,6 +266,10 @@ app.put('/api/customers/:id', async (req, res) => {
 app.delete('/api/customers/:id', async (req, res) => {
   try {
     await deleteTableData('customers', req.params.id);
+    createAndBroadcastNotification(
+      'customer',
+      `Customer record ID "${req.params.id}" has been deleted.`
+    );
     res.status(204).send();
   } catch (error) {
     console.error('[Node Proxy] Error DELETE /api/customers:', error);
@@ -233,6 +291,10 @@ app.get('/api/shipments', async (req, res) => {
 app.post('/api/shipments', async (req, res) => {
   try {
     const shipment = await insertTableData('shipments', req.body);
+    createAndBroadcastNotification(
+      'shipment',
+      `New shipment ${shipment.lrNumber || shipment.id} booked from ${shipment.origin} to ${shipment.destination}.`
+    );
     res.status(201).json(shipment);
   } catch (error) {
     console.error('[Node Proxy] Error POST /api/shipments:', error);
@@ -243,6 +305,10 @@ app.post('/api/shipments', async (req, res) => {
 app.put('/api/shipments/:id', async (req, res) => {
   try {
     const shipment = await updateTableData('shipments', req.params.id, req.body);
+    createAndBroadcastNotification(
+      'shipment',
+      `Shipment ${shipment.lrNumber || shipment.id} status updated to "${shipment.status}".`
+    );
     res.json(shipment);
   } catch (error) {
     console.error('[Node Proxy] Error PUT /api/shipments:', error);
@@ -253,6 +319,10 @@ app.put('/api/shipments/:id', async (req, res) => {
 app.delete('/api/shipments/:id', async (req, res) => {
   try {
     await deleteTableData('shipments', req.params.id);
+    createAndBroadcastNotification(
+      'shipment',
+      `Shipment record ID "${req.params.id}" has been deleted.`
+    );
     res.status(204).send();
   } catch (error) {
     console.error('[Node Proxy] Error DELETE /api/shipments:', error);
@@ -274,6 +344,10 @@ app.get('/api/payments', async (req, res) => {
 app.post('/api/payments', async (req, res) => {
   try {
     const payment = await insertTableData('payments', req.body);
+    createAndBroadcastNotification(
+      'payment',
+      `Payment of ₹${Number(payment.amount).toLocaleString('en-IN')} received from ${payment.customerName}.`
+    );
     res.status(201).json(payment);
   } catch (error) {
     console.error('[Node Proxy] Error POST /api/payments:', error);
@@ -284,6 +358,10 @@ app.post('/api/payments', async (req, res) => {
 app.delete('/api/payments/:id', async (req, res) => {
   try {
     await deleteTableData('payments', req.params.id);
+    createAndBroadcastNotification(
+      'payment',
+      `Payment record ID "${req.params.id}" has been deleted.`
+    );
     res.status(204).send();
   } catch (error) {
     console.error('[Node Proxy] Error DELETE /api/payments:', error);
@@ -305,6 +383,10 @@ app.get('/api/expenses', async (req, res) => {
 app.post('/api/expenses', async (req, res) => {
   try {
     const expense = await insertTableData('expenses', req.body);
+    createAndBroadcastNotification(
+      'expense',
+      `Expense of ₹${Number(expense.amount).toLocaleString('en-IN')} logged under "${expense.category}" paid to ${expense.paidTo}.`
+    );
     res.status(201).json(expense);
   } catch (error) {
     console.error('[Node Proxy] Error POST /api/expenses:', error);
@@ -315,6 +397,10 @@ app.post('/api/expenses', async (req, res) => {
 app.delete('/api/expenses/:id', async (req, res) => {
   try {
     await deleteTableData('expenses', req.params.id);
+    createAndBroadcastNotification(
+      'expense',
+      `Expense record ID "${req.params.id}" has been deleted.`
+    );
     res.status(204).send();
   } catch (error) {
     console.error('[Node Proxy] Error DELETE /api/expenses:', error);
@@ -362,8 +448,50 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.listen(PORT, API_BACKEND_HOST, () => {
+// Notifications Routes
+app.get('/api/notifications', (req, res) => {
+  res.json(notifications);
+});
+
+app.post('/api/notifications/read', (req, res) => {
+  notifications = notifications.map(n => ({ ...n, read: true }));
+  broadcast({ type: 'INIT_NOTIFICATIONS', notifications });
+  res.json({ success: true });
+});
+
+app.post('/api/notifications/clear', (req, res) => {
+  notifications = [];
+  broadcast({ type: 'INIT_NOTIFICATIONS', notifications });
+  res.json({ success: true });
+});
+
+const server = app.listen(PORT, API_BACKEND_HOST, () => {
   console.log(`Logistics Backend listening at http://localhost:${PORT}`);
 });
+
+const wss = new WebSocketServer({ server, path: '/ws-proxy' });
+
+wss.on('connection', (ws) => {
+  clients.add(ws);
+  console.log(`[WS] Client connected. Total clients: ${clients.size}`);
+
+  try {
+    const payload = encryptData(JSON.stringify({ type: 'INIT_NOTIFICATIONS', notifications }));
+    ws.send(JSON.stringify({ payload }));
+  } catch (err) {
+    console.error('[WS] Failed to send initial notifications:', err);
+  }
+
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log(`[WS] Client disconnected. Total clients: ${clients.size}`);
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Client connection error:', err);
+    clients.delete(ws);
+  });
+});
+
 
 
